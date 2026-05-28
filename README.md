@@ -1,12 +1,13 @@
 windows multi-connection video player powershell
-## 🚀 Installation: 
+## 🚀 Video player installation open Powershell: 
 
-- Video player installation open Powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
-scoop install git
-scoop bucket add extras
-scoop install mpv
+- Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+- Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+- scoop install git
+- scoop bucket add extras
+- scoop install mpv
+
+## 🚀 After Installation: 
 
 - Create a text file paste all codes then save with extention (.ps1)
 - Right click open with powershell, paste the download link
