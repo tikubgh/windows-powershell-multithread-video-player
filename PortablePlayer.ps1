@@ -5,13 +5,23 @@
 $Url = Read-Host "`nPaste your Video URL here and press Enter"
 $Url = $Url.Trim('"')
 
-# 2. Setup Clean Directories
+# 2. Dynamic Filename Extractor
+try {
+    $uri = [System.Uri]$Url
+    $FileName = [System.IO.Path]::GetFileName($uri.LocalPath)
+    $FileName = [System.Uri]::UnescapeDataString($FileName)
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -notmatch "\.") { $FileName = "stream_video.mkv" }
+    $FileName = $FileName -replace '[<>:"/\\|?*]', '' 
+} catch { 
+    $FileName = "stream_video.mkv" 
+}
+
+# 3. Setup Clean Directories
 $BaseDir = "$env:USERPROFILE\Downloads\PS_Stream"
 $TempDir = "$BaseDir\Chunks"
-$OutFile = "$BaseDir\video.mkv"
+$OutFile = "$BaseDir\$FileName"
 
 if (!(Test-Path $TempDir)) { New-Item -ItemType Directory -Force -Path $TempDir | Out-Null }
-if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
 
 Write-Host "`n[SYSTEM] Pinging server for exact file size..."
 try {
@@ -30,20 +40,42 @@ $ChunkSize = 5 * 1024 * 1024 # 5MB pieces
 $TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
 $TotalMB = [math]::Round($TotalBytes / 1MB, 2)
 
+Write-Host "[SYSTEM] Original Filename Detected: $FileName"
 Write-Host "[SYSTEM] Total File Size: $TotalMB MB"
-Write-Host "[SYSTEM] Slicing into $TotalChunks Sequential Chunks..."
+
+# 4. CRITICAL UPGRADE: True Resume Support
+$NextToDownload = 0
+$NextToAppend = 0
+
+if (Test-Path $OutFile) {
+    $CurrentSize = (Get-Item $OutFile).Length
+    $CompletedChunks = [math]::Floor($CurrentSize / $ChunkSize)
+    $SafeBytes = $CompletedChunks * $ChunkSize
+    
+    # Clean up any corruption if the script was closed mid-glue
+    if ($CurrentSize -gt $SafeBytes) {
+        $fs = [System.IO.File]::Open($OutFile, 'Open', 'Write')
+        $fs.SetLength($SafeBytes)
+        $fs.Close()
+    }
+    
+    $NextToDownload = $CompletedChunks
+    $NextToAppend = $CompletedChunks
+    Write-Host "[SYSTEM] RESUME DETECTED! Resuming from Chunk $CompletedChunks ($([math]::Round($SafeBytes/1MB,2)) MB)"
+} else {
+    [System.IO.File]::WriteAllBytes($OutFile, [byte[]]::new(0))
+    Write-Host "[SYSTEM] Starting fresh download..."
+}
+
+# Clean abandoned temp files from previous sessions
+if (Test-Path $TempDir) { Remove-Item "$TempDir\*" -Force -Recurse -ErrorAction SilentlyContinue }
+
 Write-Host "[SYSTEM] Engaging 10 Simultaneous Multi-Threads!`n"
 
-# Instantly create the empty video.mkv file
-[System.IO.File]::WriteAllBytes($OutFile, [byte[]]::new(0))
-
-# 3. Create a High-Performance Runspace Pool
+# 5. Create a High-Performance Runspace Pool
 $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
 $RunspacePool.Open()
 $Jobs = @{}
-
-$NextToDownload = 0
-$NextToAppend = 0
 
 # The Background Thread 
 $ScriptBlock = {
@@ -62,18 +94,24 @@ $ScriptBlock = {
         $stream.CopyTo($fs)
         $fs.Close(); $stream.Close(); $res.Close()
         return $chunkId
-    } catch { 
-        return "ERROR: $_" 
-    }
+    } catch { return "ERROR: $_" }
 }
 
-# Hide the blinking cursor for a cleaner terminal
 [Console]::CursorVisible = $false
 
-# 4. The Main Engine Loop
+# Timers & Trackers for Glitch-Free Speedometer
+$StartTime = Get-Date
+$LastTime = Get-Date
+$LastBytes = $NextToAppend * $ChunkSize
+$HighestBytesTracked = $LastBytes
+$CurrentSpeed = 0
+$MpvLaunched = if ($NextToAppend -gt 6) { $true } else { $false } # Don't auto-launch if we are resuming a nearly finished file
+
+# 6. The Main Engine Loop
 while ($NextToAppend -lt $TotalChunks) {
+    $Now = Get-Date
     
-    # Fire up to 10 connections instantly
+    # Fire up to 10 connections
     while ($Jobs.Count -lt 10 -and $NextToDownload -lt $TotalChunks) {
         $start = $NextToDownload * $ChunkSize
         $end = $start + $ChunkSize - 1
@@ -83,27 +121,21 @@ while ($NextToAppend -lt $TotalChunks) {
         $PowerShell.RunspacePool = $RunspacePool
         $Handle = $PowerShell.BeginInvoke()
         $Jobs[$NextToDownload] = [PSCustomObject]@{ PS = $PowerShell; Handle = $Handle }
-        
         $NextToDownload++
     }
 
-    # Sequence Check: Only glue the next exact chunk to prevent empty gaps
+    # Sequence Check & File Glue
     if ($Jobs.ContainsKey($NextToAppend)) {
         $job = $Jobs[$NextToAppend]
         if ($job.Handle.IsCompleted) {
-            
-            # CRITICAL FIX: Unwrap the PowerShell Collection safely into a pure string
             $rawData = $job.PS.EndInvoke($job.Handle)
             $result = "$rawData" 
-            
             $job.PS.Dispose()
             $Jobs.Remove($NextToAppend)
 
-            # Compare the pure strings
             if ($result -eq "$NextToAppend") {
                 $tmpFile = "$TempDir\$NextToAppend.tmp"
                 if (Test-Path $tmpFile) {
-                    # MAGIC GLUE: Write to video.mkv while allowing VLC to read it simultaneously
                     $in = [System.IO.File]::OpenRead($tmpFile)
                     $out = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
                     $in.CopyTo($out)
@@ -112,39 +144,71 @@ while ($NextToAppend -lt $TotalChunks) {
                 }
                 $NextToAppend++
             } else {
-                # If a background thread crashes, show why, then retry.
                 Write-Host "`n[WARNING] Thread crashed. Retrying block... (Error: $result)"
                 $NextToDownload = $NextToAppend
                 foreach ($k in $Jobs.Keys) { $Jobs[$k].PS.Stop(); $Jobs[$k].PS.Dispose() }
                 $Jobs.Clear()
-                Start-Sleep -Seconds 1
             }
         }
     }
     
-    # 5. Live UI Dashboard 
+    # 7. CRITICAL UPGRADE: Glitch-Free Telemetry Tracker
     $appendedBytes = if (Test-Path $OutFile) { (Get-Item $OutFile).Length } else { 0 }
-    $tempBytes = (Get-ChildItem -Path $TempDir -Filter "*.tmp" -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-    if ($null -eq $tempBytes) { $tempBytes = 0 }
+    $tempBytes = 0
+    foreach ($tmp in (Get-ChildItem -Path $TempDir -Filter "*.tmp" -ErrorAction SilentlyContinue)) {
+        try { $tempBytes += $tmp.Length } catch {} # Ignores locked files safely
+    }
     
     $currentBytes = $appendedBytes + $tempBytes
+    
+    # Prevents the "bouncing bytes" UI glitch during file transfers
+    if ($currentBytes -gt $HighestBytesTracked) { $HighestBytesTracked = $currentBytes }
+    else { $currentBytes = $HighestBytesTracked }
+
+    # Calculate MB/s every 1 second perfectly
+    $TimeSpan = ($Now - $LastTime).TotalSeconds
+    if ($TimeSpan -ge 1) {
+        $BytesDiff = $currentBytes - $LastBytes
+        if ($BytesDiff -ge 0) {
+            $CurrentSpeed = [math]::Round(($BytesDiff / 1MB) / $TimeSpan, 1)
+        }
+        $LastTime = $Now
+        $LastBytes = $currentBytes
+    }
+
     $pct = [math]::Round(($currentBytes / $TotalBytes) * 100, 2)
     $downMB = [math]::Round($currentBytes / 1MB, 2)
     $activeThreads = $Jobs.Count
 
-    $vlcStatus = if ($NextToAppend -gt 0) { "[READY FOR VLC]" } else { "[BUFFERING...]" }
+    # 8. MPV Auto-Launch Engine
+    $SecondsPassed = ($Now - $StartTime).TotalSeconds
+    $SecondsLeft = 30 - [math]::Floor($SecondsPassed)
     
-    $uiString = "--> $vlcStatus PROGRESS: $pct% | Downloaded: $downMB MB / $TotalMB MB | Threads: $activeThreads / 10"
-    [Console]::Write("`r" + $uiString.PadRight(100))
+    if (-not $MpvLaunched) {
+        if ($SecondsPassed -ge 30 -or $currentBytes -ge $TotalBytes) {
+            $MpvLaunched = $true
+            try {
+                Start-Process "mpv" -ArgumentList "`"$OutFile`" --vo=gpu --hwdec=auto" -WindowStyle Normal -ErrorAction SilentlyContinue
+                $vlcStatus = "[MPV PLAYING]"
+            } catch { $vlcStatus = "[MPV ERR]" }
+        } else {
+            $vlcStatus = "[LAUNCH IN: ${SecondsLeft}s]"
+        }
+    } else {
+        $vlcStatus = "[MPV PLAYING]"
+    }
+    
+    $uiString = "--> $vlcStatus PROG: $pct% | Size: $downMB / $TotalMB MB | Speed: $CurrentSpeed MB/s | Threads: $activeThreads/10"
+    [Console]::Write("`r" + $uiString.PadRight(110))
     
     Start-Sleep -Milliseconds 100 
 }
 
-# 6. Final Cleanup
+# 9. Final Cleanup
 [Console]::CursorVisible = $true
 $RunspacePool.Close()
 $RunspacePool.Dispose()
-Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path $TempDir) { Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host "`n`n[SYSTEM] Download 100% Complete! Temporary chunks deleted."
 Write-Host "[SYSTEM] Final file saved to: $OutFile"
