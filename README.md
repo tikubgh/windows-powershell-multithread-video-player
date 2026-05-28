@@ -11,5 +11,6 @@ windows multi-connection video player powershell
 
 - Create a text file paste all codes then save with extention (.ps1)
 - Right click open with powershell, paste the download link
+- Video File will be saved to \Downloads\PS_Stream
 - Enjoy...
    
