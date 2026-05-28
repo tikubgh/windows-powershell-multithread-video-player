@@ -2,28 +2,72 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $Url = (Read-Host "`nPaste Video URL").Trim('"')
 
-Write-Host "`n[NETWORK] Extracting filename..." -ForegroundColor DarkGray
-try {
-    $FileName = [System.Uri]::UnescapeDataString([System.IO.Path]::GetFileName(([System.Uri]($Url.Split('?')[0])).LocalPath)) -replace '[<>:"/\\|?*]', ''
-    if (!$FileName -or $FileName -notmatch "\.(mkv|mp4|ts|avi|webm)$") { $FileName = "stream_video.mkv" }
-} catch { $FileName = "stream_video.mkv" }
-
 $BaseDir = "$env:USERPROFILE\Downloads\PS_Stream"; $TempDir = "$BaseDir\Chunks"
 if (!(Test-Path $TempDir)) { New-Item -ItemType Directory -Force -Path $TempDir | Out-Null }
 
-Write-Host "[NETWORK] Pinging server..." -ForegroundColor DarkGray
+Write-Host "`n[NETWORK] Tricking server to extract true IDM headers & final redirects..." -ForegroundColor DarkGray
 try {
-    $req = [System.Net.WebRequest]::Create($Url); $req.Method = "HEAD"; $req.UserAgent = "Mozilla/5.0"
-    $res = $req.GetResponse(); [long]$TotalBytes = $res.ContentLength; $res.Close()
-} catch { Write-Host "[ERROR] Server blocked request."; pause; exit }
+    # The 1-Byte Trick: Use GET instead of HEAD to bypass cloud provider blocks
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = "GET" 
+    $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    $req.AddRange(0, 0) 
+    $res = $req.GetResponse()
+
+    # Determine True File Size
+    if ($res.StatusCode -eq 206 -and $res.Headers["Content-Range"] -match "/(\d+)$") {
+        [long]$TotalBytes = $matches[1]
+    } else {
+        [long]$TotalBytes = $res.ContentLength
+    }
+
+    # -----------------------------------------------------------
+    # ULTIMATE 4-TIER FILENAME EXTRACTOR
+    # -----------------------------------------------------------
+    $cd = $res.Headers["Content-Disposition"]
+    $FileName = ""
+
+    # Tier 1: IDM Header Extraction (Standard & UTF-8 encoded)
+    if (-not [string]::IsNullOrWhiteSpace($cd)) {
+        if ($cd -match "filename\*\s*=\s*UTF-8''([^;]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
+        elseif ($cd -match 'filename\s*=\s*"([^"]+)"') { $FileName = $matches[1] }
+        elseif ($cd -match 'filename\s*=\s*([^;]+)') { $FileName = $matches[1] }
+    }
+
+    # Tier 2: The Redirect Tracer (Catches the final hidden PikPak CDN path)
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
+        $FinalUrl = $res.ResponseUri.LocalPath
+        $FileName = [System.IO.Path]::GetFileName([System.Uri]::UnescapeDataString($FinalUrl))
+    }
+
+    # Tier 3: Query Parameter Sniffer (Checks for hidden tags like &name=Movie.mkv)
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
+        $Query = $res.ResponseUri.Query
+        if ($Query -match "name=([^&]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
+        elseif ($Query -match "file=([^&]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
+    }
+
+    # Tier 4: Base Fallback (Strip raw URL)
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
+        $FileName = [System.Uri]::UnescapeDataString([System.IO.Path]::GetFileName(([System.Uri]($Url.Split('?')[0])).LocalPath))
+    }
+
+    # Final Cleanup & Sanitization
+    $FileName = $FileName -replace '[<>:"/\\|?*]', ''
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -notmatch "\.") { 
+        $FileName = "cloud_video.mkv" 
+    }
+    
+    $res.Close()
+} catch { Write-Host "[ERROR] Server blocked request. Ensure the link hasn't expired."; pause; exit }
 
 [long]$ChunkSize = 5 * 1024 * 1024; [long]$TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
 $TotalMB = [math]::Round($TotalBytes / 1MB, 2)
-Write-Host "[NETWORK] Target: $FileName ($TotalMB MB)" -ForegroundColor White
+Write-Host "[NETWORK] Target File Identified: $FileName ($TotalMB MB)" -ForegroundColor White
 
 [long]$NextToDownload = 0; [long]$NextToAppend = 0; $OutFile = "$BaseDir\$FileName"; $TargetFile = $null
 
-Write-Host "[LOCAL] Checking disk for resume..." -ForegroundColor DarkGray
+Write-Host "[LOCAL] Checking disk for resume capabilities..." -ForegroundColor DarkGray
 if (Test-Path $OutFile) {
     if ((Read-Host "`n[!] FOUND: $FileName. Resume (R) or Fresh (F)? [R/F]") -match "^[rR]") { $TargetFile = Get-Item $OutFile }
     else { Remove-Item $OutFile -Force }
@@ -55,7 +99,7 @@ if ($TargetFile) {
 Get-ChildItem $TempDir -File | Where-Object { $_.Name -match "\.(tmp|done)$" } | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # -----------------------------------------------------------
-# THE "SLOW-START" ADDITIVE ENGINE (NULL-SAFE)
+# THE "SLOW-START" ADDITIVE ENGINE
 # -----------------------------------------------------------
 $CurrentLimit = 1; $ThreadLocked = $false; $FailedChunks = New-Object System.Collections.Generic.List[long]
 Write-Host "`n[ENGINE] Starting with 1 Thread. Additive scaling initialized..." -ForegroundColor Magenta
@@ -78,12 +122,10 @@ $CurrentSpeed = 0; $MpvLaunched = $false
 while ($NextToAppend -lt $TotalChunks) {
     $Now = Get-Date
     
-    # 1. Additive Scaler (Increases limit by 1 every 2 seconds if stable)
     if (-not $ThreadLocked -and $CurrentLimit -lt 10 -and ($Now - $LastRampUp).TotalSeconds -ge 2) {
         $CurrentLimit++; $LastRampUp = $Now
     }
 
-    # 2. Crash Detector & Safe Job Cleanup (No more Null errors)
     $CompletedKeys = @()
     foreach ($k in $Jobs.Keys) { if ($Jobs[$k] -and $Jobs[$k].Handle.IsCompleted) { $CompletedKeys += $k } }
     
@@ -91,7 +133,6 @@ while ($NextToAppend -lt $TotalChunks) {
         $job = $Jobs[$k]; $Jobs.Remove($k)
         if ($null -ne $job -and $null -ne $job.PS) { try { $job.PS.Dispose() } catch {} }
         
-        # If .done is missing AND it hasn't been appended yet, it was a real crash!
         if ($k -ge $NextToAppend -and -not (Test-Path "$TempDir\$k.done")) {
             if (-not $FailedChunks.Contains($k)) { $FailedChunks.Add($k) }
             if (-not $ThreadLocked) {
@@ -101,7 +142,6 @@ while ($NextToAppend -lt $TotalChunks) {
         }
     }
 
-    # 3. Smart Spawner
     while ($Jobs.Count -lt $CurrentLimit -and ($NextToDownload -lt $TotalChunks -or $FailedChunks.Count -gt 0)) {
         if ($FailedChunks.Count -gt 0) { [long]$cId = $FailedChunks[0]; $FailedChunks.RemoveAt(0) } 
         else { [long]$cId = $NextToDownload; $NextToDownload++ }
@@ -113,7 +153,6 @@ while ($NextToAppend -lt $TotalChunks) {
         }
     }
 
-    # 4. Strict Sequence Appender
     $DoneP = "$TempDir\$NextToAppend.done"; $TmpP = "$TempDir\$NextToAppend.tmp"
     if (Test-Path $DoneP) {
         $in = $null; $out = $null
@@ -124,7 +163,6 @@ while ($NextToAppend -lt $TotalChunks) {
         } catch { if ($null -ne $in) { $in.Close() }; if ($null -ne $out) { $out.Close() } }
     }
     
-    # 5. Glitch-Free Telemetry
     $OutInfo = New-Object System.IO.FileInfo($OutFile); $OutInfo.Refresh()
     [long]$cBytes = if ($OutInfo.Exists) { $OutInfo.Length } else { 0 }
     foreach ($t in (Get-ChildItem $TempDir -Filter "*.tmp" -ErrorAction SilentlyContinue)) {
@@ -139,7 +177,6 @@ while ($NextToAppend -lt $TotalChunks) {
     }
     $pct = [math]::Round(($cBytes / $TotalBytes) * 100, 2); $downMB = [math]::Round($cBytes / 1MB, 2)
 
-    # 6. MPV Launcher
     $Secs = ($Now - $StartTime).TotalSeconds
     if (-not $MpvLaunched) {
         if ($Secs -ge 30 -or $cBytes -ge $TotalBytes) {
