@@ -29,30 +29,32 @@ try {
     $req.Method = "HEAD"
     $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     $res = $req.GetResponse()
-    $TotalBytes = $res.ContentLength
+    [long]$TotalBytes = $res.ContentLength
     $res.Close()
 } catch {
     Write-Host "[ERROR] Server blocked request. Cannot build threads."
     pause; exit
 }
 
-$ChunkSize = 5 * 1024 * 1024 # 5MB pieces
-$TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
+# CRITICAL FIX: Explicit [long] 64-bit math prevents crashes on files larger than 2GB
+[long]$ChunkSize = 5 * 1024 * 1024 
+[long]$TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
 $TotalMB = [math]::Round($TotalBytes / 1MB, 2)
 
 Write-Host "[SYSTEM] Original Filename Detected: $FileName"
 Write-Host "[SYSTEM] Total File Size: $TotalMB MB"
 
-# 4. CRITICAL UPGRADE: True Resume Support
-$NextToDownload = 0
-$NextToAppend = 0
+# 4. BULLETPROOF RESUME ENGINE
+[long]$NextToDownload = 0
+[long]$NextToAppend = 0
 
 if (Test-Path $OutFile) {
-    $CurrentSize = (Get-Item $OutFile).Length
-    $CompletedChunks = [math]::Floor($CurrentSize / $ChunkSize)
-    $SafeBytes = $CompletedChunks * $ChunkSize
+    $OutFileInfo = New-Object System.IO.FileInfo($OutFile)
+    [long]$CurrentSize = $OutFileInfo.Length
+    [long]$CompletedChunks = [math]::Floor($CurrentSize / $ChunkSize)
+    [long]$SafeBytes = $CompletedChunks * $ChunkSize
     
-    # Clean up any corruption if the script was closed mid-glue
+    # If the file was corrupted mid-glue, cleanly slice it back to the last safe 5MB chunk
     if ($CurrentSize -gt $SafeBytes) {
         $fs = [System.IO.File]::Open($OutFile, 'Open', 'Write')
         $fs.SetLength($SafeBytes)
@@ -67,7 +69,7 @@ if (Test-Path $OutFile) {
     Write-Host "[SYSTEM] Starting fresh download..."
 }
 
-# Clean abandoned temp files from previous sessions
+# Wipe any ghost/abandoned temp files from previous closed sessions
 if (Test-Path $TempDir) { Remove-Item "$TempDir\*" -Force -Recurse -ErrorAction SilentlyContinue }
 
 Write-Host "[SYSTEM] Engaging 10 Simultaneous Multi-Threads!`n"
@@ -77,13 +79,14 @@ $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
 $RunspacePool.Open()
 $Jobs = @{}
 
-# The Background Thread 
+# The Background Thread (CRITICAL FIX: Signal File Architecture)
 $ScriptBlock = {
-    param($chunkId, $startByte, $endByte, $url, $tempDir)
+    param([long]$chunkId, [long]$startByte, [long]$endByte, $url, $tempDir)
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     [Net.ServicePointManager]::DefaultConnectionLimit = 100
     
     $outFile = "$tempDir\$chunkId.tmp"
+    $doneFile = "$tempDir\$chunkId.done"
     try {
         $req = [System.Net.HttpWebRequest]::Create($url)
         $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -93,8 +96,10 @@ $ScriptBlock = {
         $fs = [System.IO.File]::Create($outFile)
         $stream.CopyTo($fs)
         $fs.Close(); $stream.Close(); $res.Close()
-        return $chunkId
-    } catch { return "ERROR: $_" }
+        
+        # Create a physically verifiable '.done' file to signal success
+        [System.IO.File]::WriteAllText($doneFile, "OK")
+    } catch { }
 }
 
 [Console]::CursorVisible = $false
@@ -102,10 +107,10 @@ $ScriptBlock = {
 # Timers & Trackers for Glitch-Free Speedometer
 $StartTime = Get-Date
 $LastTime = Get-Date
-$LastBytes = $NextToAppend * $ChunkSize
-$HighestBytesTracked = $LastBytes
+[long]$LastBytes = $NextToAppend * $ChunkSize
+[long]$HighestBytesTracked = $LastBytes
 $CurrentSpeed = 0
-$MpvLaunched = if ($NextToAppend -gt 6) { $true } else { $false } # Don't auto-launch if we are resuming a nearly finished file
+$MpvLaunched = if ($NextToAppend -gt 6) { $true } else { $false }
 
 # 6. The Main Engine Loop
 while ($NextToAppend -lt $TotalChunks) {
@@ -113,8 +118,8 @@ while ($NextToAppend -lt $TotalChunks) {
     
     # Fire up to 10 connections
     while ($Jobs.Count -lt 10 -and $NextToDownload -lt $TotalChunks) {
-        $start = $NextToDownload * $ChunkSize
-        $end = $start + $ChunkSize - 1
+        [long]$start = $NextToDownload * $ChunkSize
+        [long]$end = $start + $ChunkSize - 1
         if ($end -ge $TotalBytes) { $end = $TotalBytes - 1 }
 
         $PowerShell = [powershell]::Create().AddScript($ScriptBlock).AddArgument($NextToDownload).AddArgument($start).AddArgument($end).AddArgument($Url).AddArgument($TempDir)
@@ -124,51 +129,55 @@ while ($NextToAppend -lt $TotalChunks) {
         $NextToDownload++
     }
 
-    # Sequence Check & File Glue
-    if ($Jobs.ContainsKey($NextToAppend)) {
-        $job = $Jobs[$NextToAppend]
-        if ($job.Handle.IsCompleted) {
-            $rawData = $job.PS.EndInvoke($job.Handle)
-            $result = "$rawData" 
-            $job.PS.Dispose()
+    # 7. The Rock-Solid "Signal File" Sequence Check
+    $DonePath = "$TempDir\$NextToAppend.done"
+    $TmpPath = "$TempDir\$NextToAppend.tmp"
+    
+    if (Test-Path $DonePath) {
+        # The physical file exists, meaning it is 100% safely downloaded
+        $in = [System.IO.File]::OpenRead($TmpPath)
+        $out = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $in.CopyTo($out)
+        $in.Close(); $out.Close()
+        
+        # Cleanup and move forward
+        Remove-Item $TmpPath -Force
+        Remove-Item $DonePath -Force
+        if ($Jobs.ContainsKey($NextToAppend)) { 
+            $Jobs[$NextToAppend].PS.Dispose()
             $Jobs.Remove($NextToAppend)
-
-            if ($result -eq "$NextToAppend") {
-                $tmpFile = "$TempDir\$NextToAppend.tmp"
-                if (Test-Path $tmpFile) {
-                    $in = [System.IO.File]::OpenRead($tmpFile)
-                    $out = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-                    $in.CopyTo($out)
-                    $in.Close(); $out.Close()
-                    Remove-Item $tmpFile -Force
-                }
-                $NextToAppend++
-            } else {
-                Write-Host "`n[WARNING] Thread crashed. Retrying block... (Error: $result)"
-                $NextToDownload = $NextToAppend
-                foreach ($k in $Jobs.Keys) { $Jobs[$k].PS.Stop(); $Jobs[$k].PS.Dispose() }
-                $Jobs.Clear()
-            }
         }
+        $NextToAppend++
+    } elseif ($Jobs.ContainsKey($NextToAppend) -and $Jobs[$NextToAppend].Handle.IsCompleted) {
+        # If the thread exited but the '.done' file is missing, it crashed! Restart it.
+        $Jobs[$NextToAppend].PS.Dispose()
+        $Jobs.Remove($NextToAppend)
+        $NextToDownload = $NextToAppend
+        foreach ($k in $Jobs.Keys) { $Jobs[$k].PS.Stop(); $Jobs[$k].PS.Dispose() }
+        $Jobs.Clear()
     }
     
-    # 7. CRITICAL UPGRADE: Glitch-Free Telemetry Tracker
-    $appendedBytes = if (Test-Path $OutFile) { (Get-Item $OutFile).Length } else { 0 }
-    $tempBytes = 0
+    # 8. Glitch-Free Telemetry Tracker
+    $OutFileInfo = New-Object System.IO.FileInfo($OutFile)
+    $OutFileInfo.Refresh() # Forces Windows to ignore its cache and give us the real size
+    [long]$appendedBytes = if ($OutFileInfo.Exists) { $OutFileInfo.Length } else { 0 }
+    
+    [long]$tempBytes = 0
     foreach ($tmp in (Get-ChildItem -Path $TempDir -Filter "*.tmp" -ErrorAction SilentlyContinue)) {
-        try { $tempBytes += $tmp.Length } catch {} # Ignores locked files safely
+        $TmpInfo = New-Object System.IO.FileInfo($tmp.FullName)
+        $TmpInfo.Refresh()
+        if ($TmpInfo.Exists) { $tempBytes += $TmpInfo.Length }
     }
     
-    $currentBytes = $appendedBytes + $tempBytes
+    [long]$currentBytes = $appendedBytes + $tempBytes
     
-    # Prevents the "bouncing bytes" UI glitch during file transfers
     if ($currentBytes -gt $HighestBytesTracked) { $HighestBytesTracked = $currentBytes }
     else { $currentBytes = $HighestBytesTracked }
 
-    # Calculate MB/s every 1 second perfectly
+    # Calculate precise MB/s
     $TimeSpan = ($Now - $LastTime).TotalSeconds
     if ($TimeSpan -ge 1) {
-        $BytesDiff = $currentBytes - $LastBytes
+        [long]$BytesDiff = $currentBytes - $LastBytes
         if ($BytesDiff -ge 0) {
             $CurrentSpeed = [math]::Round(($BytesDiff / 1MB) / $TimeSpan, 1)
         }
@@ -180,7 +189,7 @@ while ($NextToAppend -lt $TotalChunks) {
     $downMB = [math]::Round($currentBytes / 1MB, 2)
     $activeThreads = $Jobs.Count
 
-    # 8. MPV Auto-Launch Engine
+    # 9. MPV Auto-Launch Engine
     $SecondsPassed = ($Now - $StartTime).TotalSeconds
     $SecondsLeft = 30 - [math]::Floor($SecondsPassed)
     
@@ -204,7 +213,7 @@ while ($NextToAppend -lt $TotalChunks) {
     Start-Sleep -Milliseconds 100 
 }
 
-# 9. Final Cleanup
+# 10. Final Cleanup
 [Console]::CursorVisible = $true
 $RunspacePool.Close()
 $RunspacePool.Dispose()
