@@ -1,5 +1,5 @@
 windows multi-connection video player powershell
-## 🚀 Video player installation open Powershell: 
+## 🚀 MPV Video player installation open Powershell: 
 
 - Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 - Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
