@@ -1,71 +1,50 @@
 [Net.ServicePointManager]::DefaultConnectionLimit = 100
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$Url = (Read-Host "`nPaste Video URL").Trim('"')
+[Net.ServicePointManager]::Expect100Continue = $false 
+
+Clear-Host
+$Url = (Read-Host "`nPaste Video URL").Trim('"').Trim()
 
 $BaseDir = "$env:USERPROFILE\Downloads\PS_Stream"; $TempDir = "$BaseDir\Chunks"
 if (!(Test-Path $TempDir)) { New-Item -ItemType Directory -Force -Path $TempDir | Out-Null }
 
-Write-Host "`n[NETWORK] Tricking server to extract true IDM headers & final redirects..." -ForegroundColor DarkGray
+Write-Host "`n[NETWORK] Extracting Metadata & Tricking Firewalls..." -ForegroundColor DarkGray
 try {
-    # The 1-Byte Trick: Use GET instead of HEAD to bypass cloud provider blocks
-    $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.Method = "GET" 
-    $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    $req.AddRange(0, 0) 
+    $req = [System.Net.HttpWebRequest]::Create($Url); $req.Method = "GET"; $req.UserAgent = "Mozilla/5.0"
+    $req.AddRange(0, 0); $req.Timeout = 8000; $req.ReadWriteTimeout = 8000; $req.AllowAutoRedirect = $true
+    
     $res = $req.GetResponse()
-
-    # Determine True File Size
-    if ($res.StatusCode -eq 206 -and $res.Headers["Content-Range"] -match "/(\d+)$") {
-        [long]$TotalBytes = $matches[1]
-    } else {
-        [long]$TotalBytes = $res.ContentLength
-    }
-
-    # -----------------------------------------------------------
-    # ULTIMATE 4-TIER FILENAME EXTRACTOR
-    # -----------------------------------------------------------
-    $cd = $res.Headers["Content-Disposition"]
-    $FileName = ""
-
-    # Tier 1: IDM Header Extraction (Standard & UTF-8 encoded)
+    if ($res.StatusCode -eq 206 -and $res.Headers["Content-Range"] -match "/(\d+)$") { [long]$TotalBytes = $matches[1] } 
+    else { [long]$TotalBytes = $res.ContentLength }
+    
+    $cd = $res.Headers["Content-Disposition"]; $FileName = ""
     if (-not [string]::IsNullOrWhiteSpace($cd)) {
         if ($cd -match "filename\*\s*=\s*UTF-8''([^;]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
         elseif ($cd -match 'filename\s*=\s*"([^"]+)"') { $FileName = $matches[1] }
         elseif ($cd -match 'filename\s*=\s*([^;]+)') { $FileName = $matches[1] }
     }
-
-    # Tier 2: The Redirect Tracer (Catches the final hidden PikPak CDN path)
-    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
-        $FinalUrl = $res.ResponseUri.LocalPath
-        $FileName = [System.IO.Path]::GetFileName([System.Uri]::UnescapeDataString($FinalUrl))
-    }
-
-    # Tier 3: Query Parameter Sniffer (Checks for hidden tags like &name=Movie.mkv)
     if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
         $Query = $res.ResponseUri.Query
         if ($Query -match "name=([^&]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
-        elseif ($Query -match "file=([^&]+)") { $FileName = [System.Uri]::UnescapeDataString($matches[1]) }
     }
-
-    # Tier 4: Base Fallback (Strip raw URL)
     if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -eq "") {
         $FileName = [System.Uri]::UnescapeDataString([System.IO.Path]::GetFileName(([System.Uri]($Url.Split('?')[0])).LocalPath))
     }
 
-    # Final Cleanup & Sanitization
     $FileName = $FileName -replace '[<>:"/\\|?*]', ''
-    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -notmatch "\.") { 
-        $FileName = "cloud_video.mkv" 
-    }
+    if ([string]::IsNullOrWhiteSpace($FileName) -or $FileName -eq "download" -or $FileName -notmatch "\.") { $FileName = "stream_video.mkv" }
     
-    $res.Close()
-} catch { Write-Host "[ERROR] Server blocked request. Ensure the link hasn't expired."; pause; exit }
+    $req.Abort(); if ($res) { $res.Close() }
+} catch { 
+    Write-Host "[WARNING] Server refused metadata ping. Initiating fallback..." -ForegroundColor Yellow
+    $FileName = "stream_video.mkv"; [long]$TotalBytes = 2000000000 
+}
 
 [long]$ChunkSize = 5 * 1024 * 1024; [long]$TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
 $TotalMB = [math]::Round($TotalBytes / 1MB, 2)
-Write-Host "[NETWORK] Target File Identified: $FileName ($TotalMB MB)" -ForegroundColor White
+$OutFile = "$BaseDir\$FileName"
 
-[long]$NextToDownload = 0; [long]$NextToAppend = 0; $OutFile = "$BaseDir\$FileName"; $TargetFile = $null
+[long]$NextToDownload = 0; [long]$NextToAppend = 0; $TargetFile = $null
 
 Write-Host "[LOCAL] Checking disk for resume capabilities..." -ForegroundColor DarkGray
 if (Test-Path $OutFile) {
@@ -90,19 +69,17 @@ if ($TargetFile) {
         try { $fs = [System.IO.File]::Open($OutFile, 'Open', 'Write'); $fs.SetLength($SafeBytes); $fs.Close() } catch { Write-Host "`n[ERROR] Locked by player!"; pause; exit }
     }
     $NextToDownload = $CompChunks; $NextToAppend = $CompChunks
-    Write-Host "[LOCAL] Resuming from $([math]::Round($SafeBytes/1MB,2)) MB mark." -ForegroundColor Green
 } else {
     if (Test-Path "$TempDir\*") { Remove-Item "$TempDir\*" -Force -Recurse }
-    [System.IO.File]::WriteAllBytes($OutFile, [byte[]]::new(0)); Write-Host "[LOCAL] Fresh download sequence initiated." -ForegroundColor Green
+    [System.IO.File]::WriteAllBytes($OutFile, [byte[]]::new(0))
 }
 
 Get-ChildItem $TempDir -File | Where-Object { $_.Name -match "\.(tmp|done)$" } | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # -----------------------------------------------------------
-# THE "SLOW-START" ADDITIVE ENGINE
+# THE STABLE SEQUENTIAL ENGINE (Watchdog Enabled)
 # -----------------------------------------------------------
 $CurrentLimit = 1; $ThreadLocked = $false; $FailedChunks = New-Object System.Collections.Generic.List[long]
-Write-Host "`n[ENGINE] Starting with 1 Thread. Additive scaling initialized..." -ForegroundColor Magenta
 
 $RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10); $RunspacePool.Open(); $Jobs = @{}
 $ScriptBlock = {
@@ -110,14 +87,19 @@ $ScriptBlock = {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; [Net.ServicePointManager]::DefaultConnectionLimit = 100
     try {
         $req = [System.Net.HttpWebRequest]::Create($url); $req.UserAgent = "Mozilla/5.0"; $req.AddRange($start, $end)
+        $req.Timeout = 15000; $req.ReadWriteTimeout = 15000
         $res = $req.GetResponse(); $stream = $res.GetResponseStream(); $fs = [System.IO.File]::Create("$temp\$id.tmp")
         $stream.CopyTo($fs); $fs.Close(); $stream.Close(); $res.Close(); [System.IO.File]::WriteAllText("$temp\$id.done", "OK")
-    } catch { } 
+    } catch { if ($req) { $req.Abort() } } 
 }
 
-[Console]::CursorVisible = $false; $StartTime = Get-Date; $LastRampUp = Get-Date; $LastTime = Get-Date
+$StartTime = Get-Date; $LastRampUp = Get-Date; $LastTime = Get-Date
 [long]$HighestBytesTracked = $NextToAppend * $ChunkSize; [long]$LastBytes = $HighestBytesTracked
 $CurrentSpeed = 0; $MpvLaunched = $false
+
+# Lock UI
+Clear-Host
+[Console]::CursorVisible = $false
 
 while ($NextToAppend -lt $TotalChunks) {
     $Now = Get-Date
@@ -126,9 +108,22 @@ while ($NextToAppend -lt $TotalChunks) {
         $CurrentLimit++; $LastRampUp = $Now
     }
 
-    $CompletedKeys = @()
-    foreach ($k in $Jobs.Keys) { if ($Jobs[$k] -and $Jobs[$k].Handle.IsCompleted) { $CompletedKeys += $k } }
+    $CompletedKeys = @(); $StuckKeys = @()
+    foreach ($k in $Jobs.Keys) { 
+        if ($Jobs[$k] -and $Jobs[$k].Handle.IsCompleted) { $CompletedKeys += $k } 
+        elseif ($Jobs[$k] -and ($Now - $Jobs[$k].Started).TotalSeconds -gt 45) { $StuckKeys += $k }
+    }
     
+    foreach ($k in $StuckKeys) {
+        try { $Jobs[$k].PS.Stop(); $Jobs[$k].PS.Dispose() } catch {}
+        $Jobs.Remove($k)
+        Remove-Item "$TempDir\$k.tmp" -Force -ErrorAction SilentlyContinue
+        if (-not $FailedChunks.Contains($k)) { $FailedChunks.Add($k) }
+        if (-not $ThreadLocked) {
+            $ThreadLocked = $true; $CurrentLimit = if ($Jobs.Count -gt 0) { $Jobs.Count } else { 1 }
+        }
+    }
+
     foreach ($k in $CompletedKeys) {
         $job = $Jobs[$k]; $Jobs.Remove($k)
         if ($null -ne $job -and $null -ne $job.PS) { try { $job.PS.Dispose() } catch {} }
@@ -137,7 +132,6 @@ while ($NextToAppend -lt $TotalChunks) {
             if (-not $FailedChunks.Contains($k)) { $FailedChunks.Add($k) }
             if (-not $ThreadLocked) {
                 $ThreadLocked = $true; $CurrentLimit = if ($Jobs.Count -gt 0) { $Jobs.Count } else { 1 }
-                Write-Host "`n[NETWORK] Connection drop detected. Locking limit perfectly to $CurrentLimit threads." -ForegroundColor Yellow
             }
         }
     }
@@ -149,7 +143,7 @@ while ($NextToAppend -lt $TotalChunks) {
         if (-not $Jobs.ContainsKey($cId)) {
             [long]$start = $cId * $ChunkSize; [long]$end = $start + $ChunkSize - 1; if ($end -ge $TotalBytes) { $end = $TotalBytes - 1 }
             $PS = [powershell]::Create().AddScript($ScriptBlock).AddArgument($cId).AddArgument($start).AddArgument($end).AddArgument($Url).AddArgument($TempDir)
-            $PS.RunspacePool = $RunspacePool; $Jobs[$cId] = [PSCustomObject]@{ PS = $PS; Handle = $PS.BeginInvoke() }
+            $Jobs[$cId] = [PSCustomObject]@{ PS = $PS; Handle = $PS.BeginInvoke(); Started = Get-Date }
         }
     }
 
@@ -181,11 +175,27 @@ while ($NextToAppend -lt $TotalChunks) {
     if (-not $MpvLaunched) {
         if ($Secs -ge 30 -or $cBytes -ge $TotalBytes) {
             $MpvLaunched = $true
-            try { Start-Process "mpv" "`"$OutFile`" --vo=gpu --hwdec=auto" -WindowStyle Normal -ErrorAction SilentlyContinue; $vSt = "[MPV PLAYING]" } catch { $vSt = "[MPV ERR]" }
-        } else { $vSt = "[LAUNCH IN: $(30 - [math]::Floor($Secs))s]" }
-    } else { $vSt = "[MPV PLAYING]" }
+            try { Start-Process "mpv" "`"$OutFile`" --vo=gpu --hwdec=auto" -WindowStyle Normal -ErrorAction SilentlyContinue; $vSt = "PLAYING" } catch { $vSt = "MPV ERROR" }
+        } else { $vSt = "LAUNCHING IN $(30 - [math]::Floor($Secs))s" }
+    } else { $vSt = "PLAYING" }
     
-    [Console]::Write(("`r--> $vSt PROG: $pct% | $downMB / $TotalMB MB | Spd: $CurrentSpeed MB/s | Thr: $($Jobs.Count)/$CurrentLimit").PadRight(100)); Start-Sleep -Milliseconds 100 
+    # BULLETPROOF ASCII PROGRESS BAR
+    $barLen = 40; $filled = [math]::Floor(($pct / 100) * $barLen); $empty = $barLen - $filled
+    $bar = "#" * $filled + "-" * $empty
+    
+    $L1 = "=======================================================================".PadRight(80)
+    $L2 = " [ HIGH-SPEED STREAMING ENGINE ]   Target: $FileName".PadRight(80)
+    $L3 = "=======================================================================".PadRight(80)
+    $L4 = " [ PROGRESS ] [$bar] $pct%".PadRight(80)
+    $L5 = " [ METRICS  ] $downMB / $TotalMB MB  |  Speed: $CurrentSpeed MB/s".PadRight(80)
+    $L6 = " [ STATUS   ] $vSt  |  Threads: $($Jobs.Count) Active (Limit $CurrentLimit)".PadRight(80)
+    $L7 = "=======================================================================".PadRight(80)
+
+    [Console]::SetCursorPosition(0, 0)
+    [Console]::WriteLine($L1); [Console]::WriteLine($L2); [Console]::WriteLine($L3); [Console]::WriteLine($L4)
+    [Console]::WriteLine($L5); [Console]::WriteLine($L6); [Console]::WriteLine($L7)
+
+    Start-Sleep -Milliseconds 100 
 }
 
 [Console]::CursorVisible = $true; $RunspacePool.Close(); $RunspacePool.Dispose()
