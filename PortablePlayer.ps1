@@ -1,3 +1,5 @@
+# Force UTF-8 Encoding to ensure clean dashboard rendering
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Net.ServicePointManager]::DefaultConnectionLimit = 100
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Net.ServicePointManager]::Expect100Continue = $false 
@@ -8,7 +10,17 @@ $Url = (Read-Host "`nPaste Video URL").Trim('"').Trim()
 $BaseDir = "$env:USERPROFILE\Downloads\PS_Stream"; $TempDir = "$BaseDir\Chunks"
 if (!(Test-Path $TempDir)) { New-Item -ItemType Directory -Force -Path $TempDir | Out-Null }
 
-Write-Host "`n[NETWORK] Extracting Metadata & Tricking Firewalls..." -ForegroundColor DarkGray
+# -----------------------------------------------------------
+# LOCAL ROUTING & ISP MAPPING
+# -----------------------------------------------------------
+Write-Host "`n[NETWORK] Mapping Local Routing & ISP..." -ForegroundColor DarkGray
+try {
+    $NetInfo = Invoke-RestMethod -Uri "http://ip-api.com/json/" -UseBasicParsing -TimeoutSec 3
+    $ISP = if ($NetInfo.isp) { $NetInfo.isp } else { "Unknown ISP" }
+    $Loc = if ($NetInfo.city) { "$($NetInfo.city), $($NetInfo.country)" } else { "Unknown Location" }
+} catch { $ISP = "Local/Unknown"; $Loc = "Offline/Hidden" }
+
+Write-Host "[NETWORK] Extracting Metadata & Tricking Firewalls..." -ForegroundColor DarkGray
 try {
     $req = [System.Net.HttpWebRequest]::Create($Url); $req.Method = "GET"; $req.UserAgent = "Mozilla/5.0"
     $req.AddRange(0, 0); $req.Timeout = 8000; $req.ReadWriteTimeout = 8000; $req.AllowAutoRedirect = $true
@@ -179,21 +191,22 @@ while ($NextToAppend -lt $TotalChunks) {
         } else { $vSt = "LAUNCHING IN $(30 - [math]::Floor($Secs))s" }
     } else { $vSt = "PLAYING" }
     
-    # BULLETPROOF ASCII PROGRESS BAR
+    # BULLETPROOF ASCII PROGRESS BAR WITH NEW ROUTING LINE
     $barLen = 40; $filled = [math]::Floor(($pct / 100) * $barLen); $empty = $barLen - $filled
     $bar = "#" * $filled + "-" * $empty
     
     $L1 = "=======================================================================".PadRight(80)
     $L2 = " [ HIGH-SPEED STREAMING ENGINE ]   Target: $FileName".PadRight(80)
     $L3 = "=======================================================================".PadRight(80)
-    $L4 = " [ PROGRESS ] [$bar] $pct%".PadRight(80)
-    $L5 = " [ METRICS  ] $downMB / $TotalMB MB  |  Speed: $CurrentSpeed MB/s".PadRight(80)
-    $L6 = " [ STATUS   ] $vSt  |  Threads: $($Jobs.Count) Active (Limit $CurrentLimit)".PadRight(80)
-    $L7 = "=======================================================================".PadRight(80)
+    $L4 = " [ ROUTING  ] $ISP ($Loc)".PadRight(80)
+    $L5 = " [ PROGRESS ] [$bar] $pct%".PadRight(80)
+    $L6 = " [ METRICS  ] $downMB / $TotalMB MB  |  Speed: $CurrentSpeed MB/s".PadRight(80)
+    $L7 = " [ STATUS   ] $vSt  |  Threads: $($Jobs.Count) Active (Limit $CurrentLimit)".PadRight(80)
+    $L8 = "=======================================================================".PadRight(80)
 
     [Console]::SetCursorPosition(0, 0)
     [Console]::WriteLine($L1); [Console]::WriteLine($L2); [Console]::WriteLine($L3); [Console]::WriteLine($L4)
-    [Console]::WriteLine($L5); [Console]::WriteLine($L6); [Console]::WriteLine($L7)
+    [Console]::WriteLine($L5); [Console]::WriteLine($L6); [Console]::WriteLine($L7); [Console]::WriteLine($L8)
 
     Start-Sleep -Milliseconds 100 
 }
