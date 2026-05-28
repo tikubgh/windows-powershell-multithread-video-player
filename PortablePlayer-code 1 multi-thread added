@@ -1,0 +1,151 @@
+# 1. Main Security Protocols
+[Net.ServicePointManager]::DefaultConnectionLimit = 100
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$Url = Read-Host "`nPaste your Video URL here and press Enter"
+$Url = $Url.Trim('"')
+
+# 2. Setup Clean Directories
+$BaseDir = "$env:USERPROFILE\Downloads\PS_Stream"
+$TempDir = "$BaseDir\Chunks"
+$OutFile = "$BaseDir\video.mkv"
+
+if (!(Test-Path $TempDir)) { New-Item -ItemType Directory -Force -Path $TempDir | Out-Null }
+if (Test-Path $OutFile) { Remove-Item $OutFile -Force }
+
+Write-Host "`n[SYSTEM] Pinging server for exact file size..."
+try {
+    $req = [System.Net.WebRequest]::Create($Url)
+    $req.Method = "HEAD"
+    $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    $res = $req.GetResponse()
+    $TotalBytes = $res.ContentLength
+    $res.Close()
+} catch {
+    Write-Host "[ERROR] Server blocked request. Cannot build threads."
+    pause; exit
+}
+
+$ChunkSize = 5 * 1024 * 1024 # 5MB pieces
+$TotalChunks = [math]::Ceiling($TotalBytes / $ChunkSize)
+$TotalMB = [math]::Round($TotalBytes / 1MB, 2)
+
+Write-Host "[SYSTEM] Total File Size: $TotalMB MB"
+Write-Host "[SYSTEM] Slicing into $TotalChunks Sequential Chunks..."
+Write-Host "[SYSTEM] Engaging 10 Simultaneous Multi-Threads!`n"
+
+# Instantly create the empty video.mkv file
+[System.IO.File]::WriteAllBytes($OutFile, [byte[]]::new(0))
+
+# 3. Create a High-Performance Runspace Pool
+$RunspacePool = [runspacefactory]::CreateRunspacePool(1, 10)
+$RunspacePool.Open()
+$Jobs = @{}
+
+$NextToDownload = 0
+$NextToAppend = 0
+
+# The Background Thread 
+$ScriptBlock = {
+    param($chunkId, $startByte, $endByte, $url, $tempDir)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::DefaultConnectionLimit = 100
+    
+    $outFile = "$tempDir\$chunkId.tmp"
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($url)
+        $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        $req.AddRange($startByte, $endByte)
+        $res = $req.GetResponse()
+        $stream = $res.GetResponseStream()
+        $fs = [System.IO.File]::Create($outFile)
+        $stream.CopyTo($fs)
+        $fs.Close(); $stream.Close(); $res.Close()
+        return $chunkId
+    } catch { 
+        return "ERROR: $_" 
+    }
+}
+
+# Hide the blinking cursor for a cleaner terminal
+[Console]::CursorVisible = $false
+
+# 4. The Main Engine Loop
+while ($NextToAppend -lt $TotalChunks) {
+    
+    # Fire up to 10 connections instantly
+    while ($Jobs.Count -lt 10 -and $NextToDownload -lt $TotalChunks) {
+        $start = $NextToDownload * $ChunkSize
+        $end = $start + $ChunkSize - 1
+        if ($end -ge $TotalBytes) { $end = $TotalBytes - 1 }
+
+        $PowerShell = [powershell]::Create().AddScript($ScriptBlock).AddArgument($NextToDownload).AddArgument($start).AddArgument($end).AddArgument($Url).AddArgument($TempDir)
+        $PowerShell.RunspacePool = $RunspacePool
+        $Handle = $PowerShell.BeginInvoke()
+        $Jobs[$NextToDownload] = [PSCustomObject]@{ PS = $PowerShell; Handle = $Handle }
+        
+        $NextToDownload++
+    }
+
+    # Sequence Check: Only glue the next exact chunk to prevent empty gaps
+    if ($Jobs.ContainsKey($NextToAppend)) {
+        $job = $Jobs[$NextToAppend]
+        if ($job.Handle.IsCompleted) {
+            
+            # CRITICAL FIX: Unwrap the PowerShell Collection safely into a pure string
+            $rawData = $job.PS.EndInvoke($job.Handle)
+            $result = "$rawData" 
+            
+            $job.PS.Dispose()
+            $Jobs.Remove($NextToAppend)
+
+            # Compare the pure strings
+            if ($result -eq "$NextToAppend") {
+                $tmpFile = "$TempDir\$NextToAppend.tmp"
+                if (Test-Path $tmpFile) {
+                    # MAGIC GLUE: Write to video.mkv while allowing VLC to read it simultaneously
+                    $in = [System.IO.File]::OpenRead($tmpFile)
+                    $out = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                    $in.CopyTo($out)
+                    $in.Close(); $out.Close()
+                    Remove-Item $tmpFile -Force
+                }
+                $NextToAppend++
+            } else {
+                # If a background thread crashes, show why, then retry.
+                Write-Host "`n[WARNING] Thread crashed. Retrying block... (Error: $result)"
+                $NextToDownload = $NextToAppend
+                foreach ($k in $Jobs.Keys) { $Jobs[$k].PS.Stop(); $Jobs[$k].PS.Dispose() }
+                $Jobs.Clear()
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+    
+    # 5. Live UI Dashboard 
+    $appendedBytes = if (Test-Path $OutFile) { (Get-Item $OutFile).Length } else { 0 }
+    $tempBytes = (Get-ChildItem -Path $TempDir -Filter "*.tmp" -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    if ($null -eq $tempBytes) { $tempBytes = 0 }
+    
+    $currentBytes = $appendedBytes + $tempBytes
+    $pct = [math]::Round(($currentBytes / $TotalBytes) * 100, 2)
+    $downMB = [math]::Round($currentBytes / 1MB, 2)
+    $activeThreads = $Jobs.Count
+
+    $vlcStatus = if ($NextToAppend -gt 0) { "[READY FOR VLC]" } else { "[BUFFERING...]" }
+    
+    $uiString = "--> $vlcStatus PROGRESS: $pct% | Downloaded: $downMB MB / $TotalMB MB | Threads: $activeThreads / 10"
+    [Console]::Write("`r" + $uiString.PadRight(100))
+    
+    Start-Sleep -Milliseconds 100 
+}
+
+# 6. Final Cleanup
+[Console]::CursorVisible = $true
+$RunspacePool.Close()
+$RunspacePool.Dispose()
+Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "`n`n[SYSTEM] Download 100% Complete! Temporary chunks deleted."
+Write-Host "[SYSTEM] Final file saved to: $OutFile"
+pause
